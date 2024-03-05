@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 from matplotlib import cm
 from mpl_toolkits.mplot3d import Axes3D
 from ipywidgets import interact
+import os
 
 class Mesh:
     def __init__(self, faces, Nfaces, Nfaces_init, coords, Npoints, Npoints_init, cut_faces, side_mask, bnd_mask):
@@ -70,6 +71,34 @@ def load_square_mesh(filename):
         if (abs(coords[ino,1]-0.5)<1e-6):
             bnd_mask[ino] = 4
     return Mesh (faces, Nfaces, Nfaces_init, coords, Npoints, Npoints_init, cut_faces, side_mask, bnd_mask)
+    
+def move_critical_points(mesh, rho):
+    """
+    Displace critical points which are too close to the interface
+    (avoid rare but nasty situations of elements not properly cut)
+    """
+    # get mesh_size
+    p1 = mesh.faces[0,0]
+    p2 = mesh.faces[0,1]
+    h = np.linalg.norm(mesh.coords[p1,:]-mesh.coords[p2,:])
+    # loop over points
+    for ino in range(mesh.Npoints_init):
+        x = mesh.coords[ino,0]
+        y = mesh.coords[ino,1]
+        radius = np.sqrt(x**2+y**2)
+        cos_theta = x/radius
+        sin_theta = y/radius
+        # If node is close to interface less than 1/10*mesh_size
+        if (np.abs(rho-radius)<0.1*h):
+            # internal nodes towards interior
+            if (radius<rho):
+                new_radius = radius - 0.1*h
+            if (radius>rho):
+                new_radius = radius + 0.1*h
+            new_x = new_radius*cos_theta
+            new_y = new_radius*sin_theta             
+            mesh.coords[ino,0] = new_x
+            mesh.coords[ino,1] = new_y
 
 def is_proper(value):
     """
@@ -169,7 +198,7 @@ def split_face(mesh,ifa,rho):
         if cut:
             # Add point if not already there
             [present, idx] = check_if_present (mesh,int_coords)
-            if(not present):
+            if (not present):
                 mesh.Npoints = mesh.Npoints + 1
                 mesh.coords = np.vstack([mesh.coords,np.array([int_coords[0], int_coords[1], 0.0])])
                 idx = mesh.Npoints-1
@@ -687,24 +716,25 @@ def assemble_b_phi(mesh,phi_datum):
 def visualize_mesh(mesh,rho):
     fig, ax = plt.subplots(figsize=(20,20))
     for ifa in range(mesh.Nfaces):
-        if (mesh.faces[ifa,3]==-1):
-            nvert = 3
-        else:
-            nvert = 4
-        for ino in range(nvert):
-           p1 = mesh.coords[mesh.faces[ifa,ino],:]
-           p2 = mesh.coords[mesh.faces[ifa,(ino+1)%nvert],:]
-           dx = p2-p1
-           xx = [p1[0],p2[0]]
-           yy = [p1[1],p2[1]]
-           if (mesh.cut_faces[ifa]==0 or mesh.cut_faces[ifa]==1):
-              ax.plot(xx,yy,'k', linewidth=0.1)
-           if (mesh.cut_faces[ifa]==2 and nvert ==3):
-               ax.plot(xx,yy,'r', linewidth=1)
-           if (mesh.cut_faces[ifa]==2 and nvert ==4):
-              ax.plot(xx,yy,'b', linewidth=1)
-        circle = plt.Circle((0, 0), radius=rho, edgecolor='g', facecolor='none')
-        ax.add_patch(circle)
+        if (mesh.cut_faces[ifa]!=1):
+            if (mesh.faces[ifa,3]==-1):
+                nvert = 3
+            else:
+                nvert = 4
+            for ino in range(nvert):
+               p1 = mesh.coords[mesh.faces[ifa,ino],:]
+               p2 = mesh.coords[mesh.faces[ifa,(ino+1)%nvert],:]
+               dx = p2-p1
+               xx = [p1[0],p2[0]]
+               yy = [p1[1],p2[1]]
+               if (mesh.cut_faces[ifa]==0 or mesh.cut_faces[ifa]==1):
+                  ax.plot(xx,yy,'k', linewidth=0.1)
+               if (mesh.cut_faces[ifa]==2 and nvert ==3):
+                   ax.plot(xx,yy,'r', linewidth=1)
+               if (mesh.cut_faces[ifa]==2 and nvert ==4):
+                  ax.plot(xx,yy,'b', linewidth=1)
+            circle = plt.Circle((0, 0), radius=rho, edgecolor='g', facecolor='none')
+            ax.add_patch(circle)
     # mark generated points
     for ino in range(mesh.Npoints):
         if (ino>=mesh.Npoints_init):
@@ -722,14 +752,166 @@ def visualize_mesh(mesh,rho):
             else:
                 point = ax.scatter(xx,yy,color='violet')
 
+# reference solution (takes dof as argument to treat intface nodes)
+def reference_solution (mesh, dof, rho, ref_sol_in, ref_sol_ex):
+    if (dof<mesh.Npoints):
+        point = mesh.coords[dof,:]
+    else:
+        shift = mesh.Npoints-mesh.Npoints_init
+        point = mesh.coords[dof-shift,:]
+    # position_code: 0 internal, 1 intface in, 2 intface ex
+    on_intface = 0
+    if (dof>=mesh.Npoints_init):
+        on_intface = 1
+    if (dof>=mesh.Npoints):
+        on_intface = 2
+    radius = np.sqrt(point[0]**2+point[1]**2)
+    if (radius<rho and  on_intface==0):
+        return ref_sol_in(point[0],point[1])
+    if (radius>rho and on_intface==0):
+        return ref_sol_ex(point[0],point[1])
+    if (on_intface==1):
+        return ref_sol_in(point[0],point[1])
+    if (on_intface==2):
+        return ref_sol_ex(point[0],point[1])
+    else:
+        print ("Error: something is wrong with point coordinates")
+
 def impose_bc(mesh,A,b,u_ref):
     for ino in range(mesh.Npoints_init):
         if (mesh.bnd_mask[ino]>0):
-            x = mesh.coords[ino,0]
-            y = mesh.coords[ino,1]
-            radius = np.sqrt(x**2+y**2)
-            # ino coincides with dof as interface does not touch boundary
-            b[ino] = u_ref(x,y)
+            b[ino] = u_ref(mesh,ino)
             A[ino,:] = 0.0
             A[ino,ino] = 1
     return [A,b]
+
+def calc_L0_error (mesh, u, ref_sol):
+    u_ref = np.array([ ref_sol(mesh,dof) for dof in range(mesh.Ndof)])
+    err = u - u_ref
+    return np.max(np.abs(err))
+
+def plot_solution (mesh,u,elevation,azimuth):
+    fig = plt.figure(figsize = (15,15))
+    ax  = fig.add_subplot(111, projection='3d')
+    ax.view_init(elev=elevation, azim=azimuth)
+    for ifa in range(mesh.Nfaces):
+        if (mesh.cut_faces[ifa]!=1):
+            node_per_face = np.count_nonzero(mesh.faces[ifa,:] != -1)
+            u_F = np.zeros(node_per_face)
+            xx  = np.zeros(node_per_face)
+            yy  = np.zeros(node_per_face)
+            for ino in range(node_per_face):
+                xx[ino], yy[ino] = mesh.coords[mesh.faces[ifa][ino],0:2]
+                radius = np.sqrt((xx[ino]**2+yy[ino]**2))
+                u_F[ino] = u[glob_idx(mesh,ifa,ino)]
+            surf = ax.plot_trisurf(xx, yy, u_F, cmap=cm.coolwarm)
+    plt.show()
+
+
+def write_VTK_file (mesh, u, filename):
+    """
+    Writes solution into vtk file
+    """
+    # remove file if existing
+    if os.path.exists(filename):
+        os.remove(filename)
+
+    cells = mesh.faces.copy()
+    # interface points have to be doubled (have to assign nodally the field u)
+    no_intface_points = mesh.Npoints-mesh.Npoints_init
+    points = np.concatenate((mesh.coords,mesh.coords[mesh.Npoints_init:mesh.Npoints,:]), axis = 0).copy()
+    no_points = points.shape[0]
+    # get number of not masked elements
+    no_masked_faces = np.count_nonzero(mesh.cut_faces == 1)
+    no_cells = mesh.Nfaces-no_masked_faces
+    # get no_cells*cell_per_node + no_cells
+    noIndicesCells = 0
+    for iel in range(mesh.Nfaces):
+        if (mesh.cut_faces[iel]!=1):
+            node_per_cell = np.count_nonzero(cells[iel,:] != -1)
+            noIndicesCells = noIndicesCells + node_per_cell
+    noIndicesCells = noIndicesCells + no_cells
+
+    with open(filename, 'w') as vtk_file:
+        vtk_file.write("# vtk DataFile Version 3.0\n")
+        vtk_file.write("Broken Mesh Solution\n")
+        vtk_file.write("ASCII\n")
+        vtk_file.write("DATASET UNSTRUCTURED_GRID\n")
+        vtk_file.write(f"\nPOINTS {no_points} float\n")
+
+        for ino in range(no_points):
+            vtk_file.write(f"{points[ino,0]} {points[ino,1]} {points[ino,2]}\n")
+
+        vtk_file.write(f"\nCELLS {no_cells} {noIndicesCells}\n")
+
+        for iel in range(mesh.Nfaces):
+            if (mesh.cut_faces[iel]!=1):
+                node_per_cell = np.count_nonzero(cells[iel,:] != -1)
+                nodes = cells[iel,:]
+                # correct index of node:
+                # if element is on interface and external
+                # for the inteface node (first two) add Npoint-Npoints_init
+                if (mesh.cut_faces[iel]==2):
+                    if(mesh.side_mask[iel]==1):
+                        nodes[0] = nodes[0] + no_intface_points
+                        nodes[1] = nodes[1] + no_intface_points
+                if (node_per_cell==3):
+                    vtk_file.write(f"{3} {nodes[0]} {nodes[1]} {nodes[2]}\n")
+                elif (node_per_cell==4):
+                    vtk_file.write(f"{4} {nodes[0]} {nodes[1]} {nodes[2]} {nodes[3]}\n")
+                else:
+                    print ("ERROR: cell with not allowed number of cells")
+                    return
+
+        vtk_file.write(f"\nCELL_TYPES {no_cells}\n")
+
+        # 5: triangle; 9: quad
+        for iel in range(mesh.Nfaces):
+            if (mesh.cut_faces[iel]!=1):
+                node_per_cell = np.count_nonzero(cells[iel,:] != -1)
+                if (node_per_cell==3):
+                    vtk_file.write("5\n")
+                elif (node_per_cell==4):
+                    vtk_file.write("9\n")
+                else:
+                    print ("ERROR: cell with not allowed number of cells")
+                    return
+
+        vtk_file.write(f"\nPOINT_DATA {no_points}\n")
+        vtk_file.write("SCALARS U float\n")
+        vtk_file.write("LOOKUP_TABLE default\n")
+        for ino in range(no_points):
+            vtk_file.write(f"{u[ino]}\n")
+
+
+def solve_problem (mesh_filename, solution_filename, rho, ref_sol, sigma_in, sigma_ex, eta, phi_datum):
+    """
+    Solves an interface problem, given mesh and data.
+    Writes solution into vtk file
+
+    Returns:
+    -u: solution (np.array)
+    -mesh: Mesh object (broken)
+    """
+
+    # load mesh
+    mesh = load_square_mesh(mesh_filename)
+    # move critical points near the interface
+    move_critical_points(mesh,rho)
+    # break mesh
+    break_mesh(mesh, rho)
+    # assemble system
+    G = assemble_G(mesh, sigma_in,sigma_ex)
+    S = assemble_S(mesh)
+    M_gamma = assemble_M_gamma(mesh,sigma_in,sigma_ex)
+    N_gamma = assemble_N_gamma(mesh)
+    b_phi = assemble_b_phi(mesh,phi_datum)
+    # define system, apply bc conds an solve
+    A = G+S+eta*N_gamma-np.transpose(M_gamma) # system matrix
+    b = eta*b_phi
+    [A, b] = impose_bc(mesh, A, b, ref_sol)
+    u = np.linalg.solve(A, b)
+    write_VTK_file(mesh, u, solution_filename)
+    # calculate error
+    err = calc_L0_error(mesh, u, ref_sol)
+    return [mesh, G, S, M_gamma, N_gamma, b_phi, A, b, u, err]
