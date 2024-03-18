@@ -58,18 +58,7 @@ def load_square_mesh(filename):
     # 2: y=-0.5
     # 3: x= 0.5
     # 4: y= 0.5
-    # attention: bnd_mask keeps its size after mesh breaking
-    # it is ok as long as intface doesn't touch boundary
     bnd_mask = np.zeros(Npoints_init)
-    for ino in range(Npoints_init):
-        if (abs(coords[ino,0]+0.5)<1e-6):
-            bnd_mask[ino]= 1
-        if (abs(coords[ino,1]+0.5)<1e-6):
-            bnd_mask[ino] = 2
-        if (abs(coords[ino,0]-0.5)<1e-6):
-            bnd_mask[ino] = 3
-        if (abs(coords[ino,1]-0.5)<1e-6):
-            bnd_mask[ino] = 4
     return Mesh (faces, Nfaces, Nfaces_init, coords, Npoints, Npoints_init, cut_faces, side_mask, bnd_mask)
     
 def move_critical_points(mesh, rho):
@@ -99,6 +88,30 @@ def move_critical_points(mesh, rho):
             new_y = new_radius*sin_theta             
             mesh.coords[ino,0] = new_x
             mesh.coords[ino,1] = new_y
+            
+def move_critical_points_1D(mesh):
+    """
+    Displace critical points which are too close to the interface
+    (avoid rare but nasty situations of elements not properly cut)
+    """
+    # get mesh_size
+    p1 = mesh.faces[0,0]
+    p2 = mesh.faces[0,1]
+    h = np.linalg.norm(mesh.coords[p1,:]-mesh.coords[p2,:])
+    # minimal distance
+    eps = 0.1*h
+    # loop over points
+    for ino in range(mesh.Npoints_init):
+        x = mesh.coords[ino,0]
+        # If node is close to interface less than 1/10*mesh_size
+        if (np.abs(x)<eps):
+            # internal nodes towards interior
+            if (x<0):
+                new_x = x - eps
+            if (x>0):
+                new_x = x + eps             
+            mesh.coords[ino,0] = new_x
+
 
 def is_proper(value):
     """
@@ -155,6 +168,45 @@ def calc_intersection(x1,x2,y1,y2,rho):
         return [True, np.array([point[0], point[1],0.0])]
     else:
         return [False, np.array([0.0,0.0,0.0])]
+        
+def calc_intersection_1D(x1,x2,y1,y2):
+    """
+    Check if segment on a plane intersects line x=0
+
+    Parameters:
+    - x1: x coord of point1
+    - x2: x coord of point2
+    - y1: y coord of point1
+    - y2: y coord of point2
+
+    Returns:
+    - True/False
+    - intersection position (with 3 coords, for compatibility)
+    """
+    # Define variables
+    x, y, t= symbols('x y t')
+    # Equation of the circle centered at the origin
+    line_equation = Eq(x, 0)
+    # Parametric equations of the line segment
+    segment_x = x1 + (x2 - x1) * t
+    segment_y = y1 + (y2 - y1) * t
+    # Substitute parametric equations into the circle equation
+    line_intersection = line_equation.subs({x: segment_x, y: segment_y})
+    # Solve the resulting quadratic equation for t
+    intersection_points = solve(line_intersection, t)
+    #print("Curvilinear abscissa: ", intersection_points)
+    if (len(intersection_points)==0):
+        return [False, np.array([0.0,0.0,0.0])]
+       # Evaluate the parametric equations at the intersection points
+    intersection_coordinates = \
+       [(segment_x.subs(t, point), segment_y.subs(t, point)) for point in intersection_points]
+    #print ("Intersection points: ", intersection_coordinates)
+    if (is_proper(intersection_points[0])):
+        #print ("it's the first")
+        point = intersection_coordinates[0]
+        return [True, np.array([point[0], point[1],0.0])]
+    else:
+        return [False, np.array([0.0,0.0,0.0])]
 
 # check if face is cut
 def is_cut(mesh,ifa,rho):
@@ -170,6 +222,22 @@ def is_cut(mesh,ifa,rho):
         if (r>=r_max):
             r_max = r
     if (r_min<=rho and rho<=r_max):
+        return True
+        
+# check if face is cut
+def is_cut_1D(mesh,ifa):
+    """
+    checks if face is intersected by line x=0
+   """
+    x_min =  1e6
+    x_max = -1e6
+    for ino in range(3):
+        x = mesh.coords[mesh.faces[ifa,ino],0]
+        if (x<=x_min):
+            x_min = x
+        if (x>=x_max):
+            x_max = x
+    if (x_min<=0 and x_max>=0):
         return True
 
 # check if point is present
@@ -234,6 +302,62 @@ def split_face(mesh,ifa,rho):
     l1 = [int_fol,int_prec,v1,-1]
     l2 = [int_prec,int_fol,v2,v3]
     return [l1,l2]
+    
+def split_face_1D(mesh,ifa):
+    inters_mask = [0,0,0] #Pattern of intersections to get orientation (if counter_clock)
+    vert_mask   = [0,0,0] #Pattern of vertices for orientation (increase if side is cut)
+    inters_found = 0
+    int1 = -1             #idx intersection
+    int2 = -1
+    # Loop over Edges to find intersection
+    for ie in range(3):
+        ino1 = mesh.faces[ifa,ie]
+        ino2 = mesh.faces[ifa, (ie+1)%3]
+        point1 = mesh.coords[ino1,:]
+        point2 = mesh.coords[ino2,:]
+        [cut, int_coords] = calc_intersection_1D(point1[0], point2[0], point1[1],point2[1])
+        int_coords = int_coords.astype(float)
+        if cut:
+            # Add point if not already there
+            [present, idx] = check_if_present (mesh,int_coords)
+            if (not present):
+                mesh.Npoints = mesh.Npoints + 1
+                mesh.coords = np.vstack([mesh.coords,np.array([int_coords[0], int_coords[1], 0.0])])
+                mesh.bnd_mask=np.append(mesh.bnd_mask,-1)
+                idx = mesh.Npoints-1
+            # Mark index
+            if (inters_found == 0):
+                int1 = idx
+                inters_found = inters_found + 1
+            else:
+                int2 = idx
+            # Update Vert mask
+            vert_mask [ie] = vert_mask[ie] + 1
+            vert_mask [(ie+1)%3] = vert_mask [(ie+1)%3] + 1
+            # Update inters_mask
+            inters_mask[ie] = 1
+    # Get index of vertices in the right order
+    vert_mask = np.array(vert_mask)
+    loc_v1 = np.where(vert_mask == 2)[0][0]
+    #print ("vertex mask: ", vert_mask)
+    #print ("inters_mask: ", inters_mask)
+    #print("pos of v1: ",loc_v1)
+    v1 = mesh.faces[ifa,loc_v1]
+    v2 = mesh.faces[ifa,(loc_v1+1)%3]
+    v3 = mesh.faces[ifa,(loc_v1+2)%3]
+    # Put intersection in right order
+    if (inters_mask==[1,1,0] or inters_mask==[0,1,1]):
+        int_prec = int1
+        int_fol  = int2
+    else:
+        int_prec = int2
+        int_fol  = int1
+    # Define list of ordered vertices of new elements (the triangle first)
+    # Notice that cut edge is the first
+    l1 = [int_fol,int_prec,v1,-1]
+    l2 = [int_prec,int_fol,v2,v3]
+    return [l1,l2]
+
 
 def barycenter (mesh,ifa):
     node_per_face = np.count_nonzero(mesh.faces[ifa,:] != -1)
@@ -335,6 +459,86 @@ def break_mesh(mesh,rho):
                 else:
                         mesh.gamma_edges = np.vstack([mesh.gamma_edges, np.array([mesh.Nfaces-1, mesh.Nfaces-2])])
         elif (np.linalg.norm(barycenter(mesh,ifa))<rho):
+            mesh.side_mask[ifa] = 0
+        else:
+            mesh.side_mask[ifa] = 1
+    # Update number of deegrees of freedom
+    mesh.Ndof = mesh.Npoints_init + 2*(mesh.Npoints-mesh.Npoints_init)
+            
+def mark_bnd_points(mesh):
+    # boundary mask, code:
+    # 0: internal
+    # 1: x=-0.5
+    # 2: y=-0.5
+    # 3: x= 0.5
+    # 4: y= 0.5
+    for ino in range(mesh.Npoints):
+        if (abs(mesh.coords[ino,0]+0.5)<1e-6):
+            mesh.bnd_mask[ino]= 1
+        if (abs(mesh.coords[ino,1]+0.5)<1e-6):
+            mesh.bnd_mask[ino] = 2
+        if (abs(mesh.coords[ino,0]-0.5)<1e-6):
+            mesh.bnd_mask[ino] = 3
+        if (abs(mesh.coords[ino,1]-0.5)<1e-6):
+            mesh.bnd_mask[ino] = 4
+            
+    
+def break_mesh_1D(mesh):
+    """
+    Breaks elements cut by line x=0. In particular:
+    - generates new points and appends them to coords
+    - generates new elements and appends them to faces
+    - masks elements that are cut and are no more elements of the new mesh
+
+    Input:
+    - mesh: Mesh instance
+
+    CONVENTION FOR CONNECTIVITY:
+    - generated points appended
+    - generated faces appended
+    - cut_faces[ifa] = 0 ==> ifa is not intersected
+    - cut faces[ifa] = 1 ==> ifa is intersected and deactivated
+    - cut_faces[ifa] = 2 ==> ifa is generated by brek_mesh and may not be a triangle
+                         ==> faces[ifa,0:1] are generated points
+    """
+    for ifa in range(mesh.Nfaces_init):
+        #Check if face is cut by circle
+        if (is_cut_1D(mesh,ifa)):
+            #print ("Face: ", ifa)
+            # Mask the Face
+            mesh.cut_faces[ifa] = 1
+            # Create new nodes and faces
+            [f1,f2] = split_face_1D(mesh,ifa)
+            #print (f1,f2)
+            # Update list of faces and mask
+            mesh.faces = np.vstack([mesh.faces,np.array(f1)])
+            mesh.faces = np.vstack([mesh.faces, np.array(f2)])
+            mesh.cut_faces=np.append(mesh.cut_faces,2)
+            mesh.cut_faces=np.append(mesh.cut_faces,2)
+            mesh.Nfaces = mesh.Nfaces + 2
+            # Update mesh.side_mask
+            mesh.side_mask=np.append(mesh.side_mask,-1)
+            mesh.side_mask=np.append(mesh.side_mask,-1)
+            if (barycenter(mesh,mesh.Nfaces-2)[0]<0):
+                mesh.side_mask[mesh.Nfaces-2] = 0
+            else:
+                mesh.side_mask[mesh.Nfaces-2] = 1
+            if (barycenter(mesh,mesh.Nfaces-1)[0]<0):
+                mesh.side_mask[mesh.Nfaces-1] = 0
+            else:
+                mesh.side_mask[mesh.Nfaces-1] = 1
+            # Update gamma_edge (first element is the internal)
+            if (mesh.gamma_edges.size==0):
+                if (mesh.side_mask[mesh.Nfaces-2]==0):
+                        mesh.gamma_edges = np.array([mesh.Nfaces-2, mesh.Nfaces-1])
+                else:
+                        mesh.gamma_edges = np.array([mesh.Nfaces-1, mesh.Nfaces-2])
+            else:
+                if (mesh.side_mask[mesh.Nfaces-2]==0):
+                        mesh.gamma_edges = np.vstack([mesh.gamma_edges, np.array([mesh.Nfaces-2, mesh.Nfaces-1])])
+                else:
+                        mesh.gamma_edges = np.vstack([mesh.gamma_edges, np.array([mesh.Nfaces-1, mesh.Nfaces-2])])
+        elif (barycenter(mesh,ifa)[0]<0):
             mesh.side_mask[ifa] = 0
         else:
             mesh.side_mask[ifa] = 1
@@ -563,6 +767,22 @@ def assemble_G(mesh,sigma_in,sigma_ex):
                     glob_j = glob_idx(mesh,ifa,j)
                     G[glob_i,glob_j] = G[glob_i,glob_j] +sigma*mod_F*np.dot(GRAD[:,i],GRAD[:,j])
     return G
+    
+def assemble_G_no_sigma(mesh):
+    # Assemble matrix G_no_sigma (to calculate H1 like norm)
+    G = np.zeros((mesh.Ndof,mesh.Ndof))
+    for ifa in range(mesh.Nfaces):
+        side = mesh.side_mask[ifa]
+        if (mesh.cut_faces[ifa] != 1):
+            node_per_face = np.count_nonzero(mesh.faces[ifa,:] != -1)
+            GRAD = GR(mesh,ifa)
+            mod_F = calc_surface(mesh,ifa)
+            for i in range(node_per_face):
+                for j in range(node_per_face):
+                    glob_i = glob_idx(mesh,ifa,i)
+                    glob_j = glob_idx(mesh,ifa,j)
+                    G[glob_i,glob_j] = G[glob_i,glob_j] +mod_F*np.dot(GRAD[:,i],GRAD[:,j])
+    return G
 
 def assemble_S(mesh):
     # Assemble matrix S (stabilization)
@@ -751,6 +971,46 @@ def visualize_mesh(mesh,rho):
                 point = ax.scatter(xx,yy,color='orange')
             else:
                 point = ax.scatter(xx,yy,color='violet')
+                
+def visualize_mesh_1D(mesh):
+    fig, ax = plt.subplots(figsize=(20,20))
+    for ifa in range(mesh.Nfaces):
+        if (mesh.cut_faces[ifa]!=1):
+            if (mesh.faces[ifa,3]==-1):
+                nvert = 3
+            else:
+                nvert = 4
+            for ino in range(nvert):
+               p1 = mesh.coords[mesh.faces[ifa,ino],:]
+               p2 = mesh.coords[mesh.faces[ifa,(ino+1)%nvert],:]
+               dx = p2-p1
+               xx = [p1[0],p2[0]]
+               yy = [p1[1],p2[1]]
+               if (mesh.cut_faces[ifa]==0 or mesh.cut_faces[ifa]==1):
+                  ax.plot(xx,yy,'k', linewidth=0.1)
+               if (mesh.cut_faces[ifa]==2 and nvert ==3):
+                   ax.plot(xx,yy,'r', linewidth=1)
+               if (mesh.cut_faces[ifa]==2 and nvert ==4):
+                  ax.plot(xx,yy,'b', linewidth=1)
+            line_x = [0.0, 0.0]
+            line_y = [-0.5,0.5]
+            ax.plot(line_x,line_y, color='green')
+    # mark generated points
+    for ino in range(mesh.Npoints):
+        if (ino>=mesh.Npoints_init):
+            xx = mesh.coords[ino,0]
+            yy = mesh.coords[ino,1]
+            point = ax.scatter(xx,yy,color='green')
+    # mark mesh.faces according to side
+    for ifa in range(mesh.Nfaces):
+        if (mesh.cut_faces[ifa]!=1):
+            p = barycenter(mesh,ifa)
+            xx = p[0]
+            yy = p[1]
+            if (mesh.side_mask[ifa]==0):
+                point = ax.scatter(xx,yy,color='orange')
+            else:
+                point = ax.scatter(xx,yy,color='violet')
 
 # reference solution (takes dof as argument to treat intface nodes)
 def reference_solution (mesh, dof, rho, ref_sol_in, ref_sol_ex):
@@ -776,6 +1036,31 @@ def reference_solution (mesh, dof, rho, ref_sol_in, ref_sol_ex):
         return ref_sol_ex(point[0],point[1])
     else:
         print ("Error: something is wrong with point coordinates")
+        
+# reference solution for 1D solution
+def reference_1D_solution (mesh, dof, ref_sol_min, ref_sol_plus):
+    if (dof<mesh.Npoints):
+        point = mesh.coords[dof,:]
+    else:
+        shift = mesh.Npoints-mesh.Npoints_init
+        point = mesh.coords[dof-shift,:]
+    # position_code: 0 internal, 1 intface in, 2 intface ex
+    on_intface = 0
+    if (dof>=mesh.Npoints_init):
+        on_intface = 1
+    if (dof>=mesh.Npoints):
+        on_intface = 2
+    x = point[0]
+    if (x<0 and  on_intface==0):
+        return ref_sol_min(point[0],point[1])
+    if (x>0 and on_intface==0):
+        return ref_sol_plus(point[0],point[1])
+    if (on_intface==1):
+        return ref_sol_min(point[0],point[1])
+    if (on_intface==2):
+        return ref_sol_plus(point[0],point[1])
+    else:
+        print ("Error: something is wrong with point coordinates")
 
 def impose_bc(mesh,A,b,u_ref):
     for ino in range(mesh.Npoints_init):
@@ -789,6 +1074,14 @@ def calc_L0_error (mesh, u, ref_sol):
     u_ref = np.array([ ref_sol(mesh,dof) for dof in range(mesh.Ndof)])
     err = u - u_ref
     return np.max(np.abs(err))
+    
+def calc_energy_error (mesh, u, ref_sol, G_no_sigma, N_gamma, S):
+    u_ref = np.array([ ref_sol(mesh,dof) for dof in range(mesh.Ndof)])
+    err = u - u_ref
+    contrib_1 = np.dot(np.dot(G_no_sigma,err),err)
+    contrib_2 = np.dot(np.dot(N_gamma,err),err)
+    contrib_3 = np.dot(np.dot(S,err),err)
+    return np.sqrt(contrib_1+contrib_2+contrib_3)
 
 def plot_solution (mesh,u,elevation,azimuth):
     fig = plt.figure(figsize = (15,15))
@@ -902,6 +1195,7 @@ def solve_problem (mesh_filename, solution_filename, rho, ref_sol, sigma_in, sig
     break_mesh(mesh, rho)
     # assemble system
     G = assemble_G(mesh, sigma_in,sigma_ex)
+    G_no_sigma = assemble_G_no_sigma(mesh)
     S = assemble_S(mesh)
     M_gamma = assemble_M_gamma(mesh,sigma_in,sigma_ex)
     N_gamma = assemble_N_gamma(mesh)
@@ -913,5 +1207,45 @@ def solve_problem (mesh_filename, solution_filename, rho, ref_sol, sigma_in, sig
     u = np.linalg.solve(A, b)
     write_VTK_file(mesh, u, solution_filename)
     # calculate error
-    err = calc_L0_error(mesh, u, ref_sol)
-    return [mesh, G, S, M_gamma, N_gamma, b_phi, A, b, u, err]
+    err_L0 = calc_L0_error(mesh, u, ref_sol)
+    err_energy = calc_energy_error(mesh, u, ref_sol, G_no_sigma, N_gamma, S)
+    return [mesh, G, G_no_sigma, S, M_gamma, N_gamma, b_phi, A, b, u, err_L0, err_energy]
+    
+def solve_problem_1D (mesh_filename, solution_filename, ref_sol, sigma_min, sigma_plus, eta, phi_datum):
+    """
+    Solves an interface problem, given mesh and data.
+    Writes solution into vtk file
+
+    Returns:
+    -u: solution (np.array)
+    -mesh: Mesh object (broken)
+    """
+
+    # load mesh
+    mesh = load_square_mesh(mesh_filename)
+    # move critical points near the interface
+    move_critical_points_1D(mesh)
+    # break mesh
+    break_mesh_1D(mesh)
+    # assign boundaries
+    mark_bnd_points(mesh)
+    # assemble system
+    G = assemble_G(mesh, sigma_min,sigma_plus)
+    G_no_sigma = assemble_G_no_sigma(mesh)
+    S = assemble_S(mesh)
+    M_gamma = assemble_M_gamma(mesh,sigma_min,sigma_plus)
+    N_gamma = assemble_N_gamma(mesh)
+    b_phi = assemble_b_phi(mesh,phi_datum)
+    # define system, apply bc conds an solve
+    A = G+S+eta*N_gamma-np.transpose(M_gamma) # system matrix
+    b = eta*b_phi
+    [A, b] = impose_bc(mesh, A, b, ref_sol)
+    u = np.linalg.solve(A, b)
+    write_VTK_file(mesh, u, solution_filename)
+    # calculate error
+    err_L0 = calc_L0_error(mesh, u, ref_sol)
+    err_energy = calc_energy_error(mesh, u, ref_sol, G_no_sigma, N_gamma, S)
+    return [mesh, G, G_no_sigma, S, M_gamma, N_gamma, b_phi, A, b, u, err_L0, err_energy]
+    
+    
+
