@@ -1062,14 +1062,14 @@ def reference_1D_solution (mesh, dof, ref_sol_min, ref_sol_plus):
     else:
         print ("Error: something is wrong with point coordinates")
 
-def impose_bc(mesh,A,b,u_ref):
+def impose_bc(mesh,A,b,ref_sol):
     for dof in range(mesh.Ndof):
         if (dof<mesh.Npoints):
             ino = dof
         else:
             ino = dof-(mesh.Npoints-mesh.Npoints_init)
         if (mesh.bnd_mask[ino]>0):
-            b[dof] = u_ref(mesh,dof)
+            b[dof] = ref_sol(mesh,dof)
             A[dof,:] = 0.0
             A[dof,dof] = 1
     return [A,b]
