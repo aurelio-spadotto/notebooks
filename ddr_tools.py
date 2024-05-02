@@ -1,5 +1,8 @@
 import meshio
 import numpy as np
+from scipy.sparse.linalg import gmres
+from scipy.sparse.linalg import cg
+from scipy.sparse.linalg import bicg
 from sympy import symbols, Eq, solve, sqrt
 import matplotlib.pyplot as plt
 from matplotlib import cm
@@ -18,7 +21,7 @@ class Mesh:
         self.cut_faces = cut_faces
         self.side_mask = side_mask
         self.bnd_mask = bnd_mask
-        self.gamma_edges = np.array([])
+        self.gamma_edges = []
         self.Ndof = self.Npoints
 
 
@@ -448,23 +451,17 @@ def break_mesh(mesh,rho):
             else:
                 mesh.side_mask[mesh.Nfaces-1] = 1
             # Update gamma_edge (first element is the internal)
-            if (mesh.gamma_edges.size==0):
-                if (mesh.side_mask[mesh.Nfaces-2]==0):
-                        mesh.gamma_edges = np.array([mesh.Nfaces-2, mesh.Nfaces-1])
-                else:
-                        mesh.gamma_edges = np.array([mesh.Nfaces-1, mesh.Nfaces-2])
+            if (mesh.side_mask[mesh.Nfaces-2]==0):
+                mesh.gamma_edges.append(np.array([mesh.Nfaces-2, mesh.Nfaces-1]))
             else:
-                if (mesh.side_mask[mesh.Nfaces-2]==0):
-                        mesh.gamma_edges = np.vstack([mesh.gamma_edges, np.array([mesh.Nfaces-2, mesh.Nfaces-1])])
-                else:
-                        mesh.gamma_edges = np.vstack([mesh.gamma_edges, np.array([mesh.Nfaces-1, mesh.Nfaces-2])])
+                mesh.gamma_edges.append(np.array([mesh.Nfaces-1, mesh.Nfaces-2]))
         elif (np.linalg.norm(barycenter(mesh,ifa))<rho):
             mesh.side_mask[ifa] = 0
         else:
             mesh.side_mask[ifa] = 1
     # Update number of deegrees of freedom
     mesh.Ndof = mesh.Npoints_init + 2*(mesh.Npoints-mesh.Npoints_init)
-            
+
 def mark_bnd_points(mesh):
     # boundary mask, code:
     # 0: internal
@@ -528,16 +525,20 @@ def break_mesh_1D(mesh):
             else:
                 mesh.side_mask[mesh.Nfaces-1] = 1
             # Update gamma_edge (first element is the internal)
-            if (mesh.gamma_edges.size==0):
-                if (mesh.side_mask[mesh.Nfaces-2]==0):
-                        mesh.gamma_edges = np.array([mesh.Nfaces-2, mesh.Nfaces-1])
-                else:
-                        mesh.gamma_edges = np.array([mesh.Nfaces-1, mesh.Nfaces-2])
+            if (mesh.side_mask[mesh.Nfaces-2]==0):
+                mesh.gamma_edges.append(np.array([mesh.Nfaces-2, mesh.Nfaces-1]))
             else:
-                if (mesh.side_mask[mesh.Nfaces-2]==0):
-                        mesh.gamma_edges = np.vstack([mesh.gamma_edges, np.array([mesh.Nfaces-2, mesh.Nfaces-1])])
-                else:
-                        mesh.gamma_edges = np.vstack([mesh.gamma_edges, np.array([mesh.Nfaces-1, mesh.Nfaces-2])])
+                mesh.gamma_edges.append(np.array([mesh.Nfaces-1, mesh.Nfaces-2]))
+#            if (mesh.gamma_edges.size==0):
+#                if (mesh.side_mask[mesh.Nfaces-2]==0):
+#                        mesh.gamma_edges = np.array([mesh.Nfaces-2, mesh.Nfaces-1])
+#                else:
+#                        mesh.gamma_edges = np.array([mesh.Nfaces-1, mesh.Nfaces-2])
+#            else:
+#                if (mesh.side_mask[mesh.Nfaces-2]==0):
+#                        mesh.gamma_edges = np.vstack([mesh.gamma_edges, np.array([mesh.Nfaces-2, mesh.Nfaces-1])])
+#                else:
+#                        mesh.gamma_edges = np.vstack([mesh.gamma_edges, np.array([mesh.Nfaces-1, mesh.Nfaces-2])])
         elif (barycenter(mesh,ifa)[0]<0):
             mesh.side_mask[ifa] = 0
         else:
@@ -566,6 +567,9 @@ def GR (mesh,ifa):
 
 # Potential RECONSTRUCTION matrix (node_per_face, node_per_face)
 def recpot (mesh,ifa):
+  """
+  tolerance 1e-30
+  """
   node_per_face = np.count_nonzero(mesh.faces[ifa,:] != -1)
   dim_basis     = 3 #dimension of basis of R,c2(T)
   V = np.zeros ((node_per_face, dim_basis)) #evaluation matrix
@@ -664,8 +668,13 @@ def recpot (mesh,ifa):
                     # get surface of face
                     mod_F = calc_surface (mesh,ifa)
                     B1[i][j] = B1[i][j] -(1/mod_F)* simpson(start, end, lambda x,y: np.dot(normal,chi_ij(x,y)))
-  #calculate the final local matrix S an store it
-  R = np.dot(V, np.linalg.solve(M,(B1+B2)))
+  #calculate the final local matrix R and store it
+  #tolerance = 1e-18
+  #x = np.zeros((dim_basis, node_per_face))
+  #for col in range(node_per_face):
+  #    x[:,col], info =  bicg(M,(B1+B2)[:,col], tol=tolerance)
+  #R = np.dot(V, x)
+  R = np.dot(V, np.linalg.solve(M, (B1+B2)))
   return R
 
 # Convention: internal unknowns, intface unknowns side in, intface unknowns side ex
@@ -693,15 +702,19 @@ def kron(i,j):
     else:
         return 0
 
+#####################################################
+#          MESH CONSTRUCTION
+#####################################################
+
 def assemble_M_gamma(mesh,sigma_in,sigma_ex):
     # Matrix M_gamma (jump of gradient)
     M_gamma = np.zeros((mesh.Ndof,mesh.Ndof))
-    for ied in range(mesh.gamma_edges.shape[0]):
+    for ied in range(len(mesh.gamma_edges)):
         # table of dofs touched by the edge
         # 7 dofs: 3 from the triangle + 4 from the quad
         edge_dofs = np.zeros((7,2),dtype=int)
-        ifa_in = mesh.gamma_edges[ied,0]
-        ifa_ex = mesh.gamma_edges[ied,1]
+        ifa_in = mesh.gamma_edges[ied][0]
+        ifa_ex = mesh.gamma_edges[ied][1]
         node_per_face_in = np.count_nonzero(mesh.faces[ifa_in,:] != -1)
         node_per_face_ex = np.count_nonzero(mesh.faces[ifa_ex,:] != -1)
         # dofs ifa_in
@@ -807,12 +820,12 @@ def calc_r2_prod_integ(v1A,v1B,v2A,v2B):
 def assemble_N_gamma(mesh):
     # matrix N_gamma (jump penalisation)
     N_gamma = np.zeros((mesh.Ndof,mesh.Ndof))
-    for ied in range(mesh.gamma_edges.shape[0]):
+    for ied in range(len(mesh.gamma_edges)):
         # table of dofs touched by the edge
         # 7 dofs: 3 from the triangle + 4 from the quad
         edge_dofs = np.zeros((7,2),dtype=int)
-        ifa_in = mesh.gamma_edges[ied,0]
-        ifa_ex = mesh.gamma_edges[ied,1]
+        ifa_in = mesh.gamma_edges[ied][0]
+        ifa_ex = mesh.gamma_edges[ied][1]
         node_per_face_in = np.count_nonzero(mesh.faces[ifa_in,:] != -1)
         node_per_face_ex = np.count_nonzero(mesh.faces[ifa_ex,:] != -1)
         # dofs ifa_in
@@ -874,12 +887,12 @@ def assemble_N_gamma(mesh):
 
 def assemble_b_phi(mesh,phi_datum):
     b_phi = np.zeros((mesh.Ndof))
-    for ied in range(mesh.gamma_edges.shape[0]):
+    for ied in range(len(mesh.gamma_edges)):
         # table of dofs touched by the edge
         # 7 dofs: 3 from the triangle + 4 from the quad
         edge_dofs = np.zeros((7,2),dtype=int)
-        ifa_in = mesh.gamma_edges[ied,0]
-        ifa_ex = mesh.gamma_edges[ied,1]
+        ifa_in = mesh.gamma_edges[ied][0]
+        ifa_ex = mesh.gamma_edges[ied][1]
         node_per_face_in = np.count_nonzero(mesh.faces[ifa_in,:] != -1)
         node_per_face_ex = np.count_nonzero(mesh.faces[ifa_ex,:] != -1)
         # dofs ifa_in
